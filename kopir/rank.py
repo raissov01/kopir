@@ -40,12 +40,14 @@ class BM25:
 
 
 def search(query: str, docs: list[list[str]], *, limit: int, min_score: float,
-           min_hits: int) -> list[tuple[float, int]]:
+           min_hits: int, heads: list[set[str]] | None = None) -> list[tuple[float, int]]:
     """Ranked (score, index) pairs that clear the thresholds.
 
     A single shared word is rarely a real match in a corpus this mixed, so a
     hit needs `min_hits` distinct query terms unless the query itself is that
-    short.
+    short. With `heads`, at least one query term must also appear in the
+    document's head (a record's name and description, a turn's question):
+    words shared only with a long body are what makes chatty prompts drift.
     """
     q = tokens(query)
     if not q or not docs:
@@ -54,6 +56,7 @@ def search(query: str, docs: list[list[str]], *, limit: int, min_score: float,
     # IDF, and so every score, grows with the corpus; `min_score` is tuned
     # for a few hundred records and scaled down for smaller ones.
     floor = min_score * min(1.0, math.log1p(len(docs)) / math.log1p(REF_DOCS))
+    qset = set(q)
     ranked = BM25(docs).score(q)
     if not ranked:
         return []
@@ -61,6 +64,8 @@ def search(query: str, docs: list[list[str]], *, limit: int, min_score: float,
     out = []
     for s, hit, i in ranked:
         if s < floor or hit < need or s < 0.4 * top:
+            continue
+        if heads is not None and not heads[i] & qset:
             continue
         out.append((s, i))
         if len(out) >= limit:

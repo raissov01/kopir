@@ -1,2 +1,2 @@
-"""kopir: shared memory and a conversation bridge between Claude Code and Codex."""
-__version__ = "0.1.0"
+"""kopir: shared memory and a conversation bridge between AI agents."""
+__version__ = "0.2.0"

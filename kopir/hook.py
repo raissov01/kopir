@@ -1,4 +1,5 @@
-"""Hook entry point for Claude Code and Codex (same wire format).
+"""Hook entry point for every agent with command hooks (Claude Code, Codex and
+Gemini CLI share one wire format; only the event names differ).
 
 Reads the event JSON on stdin and prints `hookSpecificOutput.additionalContext`.
 A hook must never stand between a person and their prompt: every failure is
@@ -10,7 +11,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import config, context, sessions
+from . import agents, config, context, sessions
 
 
 def _emit(event: str, text: str) -> None:
@@ -24,19 +25,18 @@ def run(agent: str, payload: dict, cfg: dict) -> str:
     cwd = payload.get("cwd", "")
     sid = payload.get("session_id", "")
     deadline = time.monotonic() + cfg["hook_deadline_sec"]
-    other = context.OTHER[agent]
     cache = sessions.Cache(cfg)
-    cache.refresh({other}, deadline)
+    cache.refresh(set(agents.AGENTS) - {agent}, deadline)
     cache.save()
     seen = context.Seen(cfg, f"{agent}-{sid}")
     parts = []
-    if event == "SessionStart":
+    if event in agents.START_EVENTS:
         if payload.get("source") in ("compact", "clear"):
             seen.items.clear()  # earlier injections are gone from the context
         if agent in cfg["inject_index_for"]:
             parts.append(context.index_text(cfg))
         parts.append(context.recent_digest(cfg, cache, agent, cwd))
-    elif event == "UserPromptSubmit":
+    elif event in agents.PROMPT_EVENTS:
         prompt = payload.get("prompt", "")
         text, keys = context.recall_records(cfg, prompt, seen)
         parts.append(text)

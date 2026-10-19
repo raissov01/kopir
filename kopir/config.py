@@ -1,5 +1,5 @@
-"""Paths and limits. Defaults fit a stock Claude Code + Codex install; any key
-can be overridden in ~/.config/kopir/config.json."""
+"""Paths and limits. Defaults fit stock installs of the supported agents; any
+key can be overridden in ~/.config/kopir/config.json."""
 import json
 import os
 from pathlib import Path
@@ -12,12 +12,26 @@ def _claude_slug(path: Path) -> str:
     return str(path).replace("/", "-").replace(".", "-")
 
 
+def _default_memory_dir() -> str:
+    # Claude Code already keeps an auto-memory in this shape; sharing it means
+    # Claude's own memory feeds every other agent. Without Claude, a neutral home.
+    claude = HOME / ".claude" / "projects" / _claude_slug(HOME) / "memory"
+    if claude.is_dir():
+        return str(claude)
+    return str(HOME / ".local" / "share" / "kopir" / "memory")
+
+
 DEFAULTS = {
     # Memory records shared by every agent.
-    "memory_dir": str(HOME / ".claude" / "projects" / _claude_slug(HOME) / "memory"),
+    "memory_dir": _default_memory_dir(),
     "claude_projects": str(HOME / ".claude" / "projects"),
-    "codex_home": str(HOME / ".codex"),
+    "codex_home": os.environ.get("CODEX_HOME", str(HOME / ".codex")),
+    "gemini_home": str(HOME / ".gemini"),
+    # The snap package keeps its state under ~/snap.
+    "copilot_homes": [os.environ.get("COPILOT_HOME", str(HOME / ".copilot")),
+                      str(HOME / "snap" / "copilot-cli" / "current" / ".copilot")],
     "cache_dir": str(HOME / ".cache" / "kopir"),
+    "data_dir": str(HOME / ".local" / "share" / "kopir"),
     # Codex thread sources that are a person typing; "exec" runs are scripts.
     "codex_sources": ["cli", "vscode"],
     # Index files never served as records.
@@ -35,7 +49,7 @@ DEFAULTS = {
     "record_chars": 1300,
     "hook_deadline_sec": 3.0,
     # Agents that do not load MEMORY.md themselves get it at session start.
-    "inject_index_for": ["codex"],
+    "inject_index_for": ["codex", "gemini", "copilot", "mcp"],
 }
 
 
@@ -44,7 +58,8 @@ def load() -> dict:
     path = Path(os.environ.get("KOPIR_CONFIG", HOME / ".config" / "kopir" / "config.json"))
     if path.is_file():
         cfg.update(json.loads(path.read_text(encoding="utf-8")))
-    for key in ("memory_dir", "claude_projects", "codex_home", "cache_dir"):
+    for key in ("memory_dir", "claude_projects", "codex_home", "gemini_home",
+                "cache_dir", "data_dir"):
         env = os.environ.get("KOPIR_" + key.upper())
         if env:
             cfg[key] = env

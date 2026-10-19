@@ -2,12 +2,12 @@ import argparse
 import json
 import time
 
-from . import __version__, config, context, hook, install, memory, sessions
+from . import __version__, agents, config, context, hook, install, mcp, memory, sessions
 
 
-def _cache(cfg: dict, agents=("claude", "codex"), deadline: float = 1e18) -> sessions.Cache:
+def _cache(cfg: dict, deadline: float = 1e18) -> sessions.Cache:
     cache = sessions.Cache(cfg)
-    cache.refresh(set(agents), deadline)
+    cache.refresh(set(agents.AGENTS), deadline)
     cache.save()
     return cache
 
@@ -16,20 +16,20 @@ def cmd_recall(cfg, a):
     text, _ = context.recall_records(cfg, a.query, None)
     print(text or "(no matching records)")
     if a.agent:
-        cache = _cache(cfg, [context.OTHER[a.agent]])
+        cache = _cache(cfg)
         turns, _ = context.recall_turns(cfg, cache, a.agent, a.query, None)
         if turns:
             print("\n" + turns)
 
 
 def cmd_recent(cfg, a):
-    cache = _cache(cfg, [context.OTHER[a.agent]])
+    cache = _cache(cfg)
     cfg = {**cfg, "recent_hours": a.hours}
     print(context.recent_digest(cfg, cache, a.agent, a.cwd) or "(nothing recent)")
 
 
 def cmd_show(cfg, a):
-    cache = _cache(cfg, [a.agent])
+    cache = _cache(cfg)
     for s in cache.sessions(a.agent):
         if s["id"].startswith(a.id):
             print(f"# {s['title']}\n{s['cwd']} · {s['started']} → {s['updated']}\n")
@@ -43,7 +43,7 @@ def cmd_show(cfg, a):
 def cmd_index(cfg, a):
     t = time.monotonic()
     cache = _cache(cfg)
-    for agent in ("claude", "codex"):
+    for agent in sorted(set(agents.AGENTS) | cache.agents()):
         ss = cache.sessions(agent)
         print(f"{agent}: {len(ss)} sessions, {sum(len(s['turns']) for s in ss)} turns")
     print(f"{time.monotonic() - t:.1f}s, cache {cache.path}")
@@ -69,7 +69,7 @@ def cmd_backfill(cfg, a):
 
 
 def cmd_install(cfg, a):
-    for line in install.install(cfg, uninstall=a.uninstall):
+    for line in install.install(cfg, uninstall=a.uninstall, mcp=a.mcp):
         print(line)
     if not a.uninstall:
         cmd_index(cfg, a)
@@ -77,6 +77,10 @@ def cmd_install(cfg, a):
 
 def cmd_hook(cfg, a):
     return hook.main(a.agent)
+
+
+def cmd_mcp(cfg, a):
+    return mcp.serve()
 
 
 def cmd_config(cfg, a):
@@ -87,21 +91,21 @@ def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="kopir", description=__doc__)
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="cmd", required=True)
-    agents = ("claude", "codex")
+    names = tuple(agents.AGENTS)
 
     s = sub.add_parser("recall", help="memory records (and other-agent turns) for a query")
     s.add_argument("query")
-    s.add_argument("--agent", choices=agents, help="also search the other agent's chats")
+    s.add_argument("--agent", choices=names, help="also search the other agent's chats")
     s.set_defaults(fn=cmd_recall)
 
     s = sub.add_parser("recent", help="what the session-start hook would show")
-    s.add_argument("--agent", choices=agents, default="claude", help="the agent asking")
+    s.add_argument("--agent", choices=names, default="claude", help="the agent asking")
     s.add_argument("--hours", type=int, default=48)
     s.add_argument("--cwd", default="")
     s.set_defaults(fn=cmd_recent)
 
     s = sub.add_parser("show", help="print one conversation")
-    s.add_argument("agent", choices=agents)
+    s.add_argument("agent", help="claude, codex, gemini, copilot or an MCP client name")
     s.add_argument("id", help="session id or its prefix")
     s.set_defaults(fn=cmd_show)
 
@@ -117,13 +121,20 @@ def main(argv: list[str]) -> int:
     s.add_argument("--source", default="", help="source for records without a session id")
     s.set_defaults(fn=cmd_backfill)
 
-    s = sub.add_parser("install", help="add hooks to Claude Code and Codex")
+    s = sub.add_parser("install", help="wire kopir into every installed agent")
     s.add_argument("--uninstall", action="store_true")
+    s.add_argument("--mcp", nargs="*", default=[], metavar="CLIENT",
+                   choices=sorted({n for n, a in agents.AGENTS.items() if a.mcp_file}
+                                  | set(agents.MCP_CLIENTS)),
+                   help="also register the MCP server with these clients")
     s.set_defaults(fn=cmd_install)
 
     s = sub.add_parser("hook", help="hook entry point (reads event JSON on stdin)")
-    s.add_argument("--agent", choices=agents, required=True)
+    s.add_argument("--agent", choices=names, required=True)
     s.set_defaults(fn=cmd_hook)
+
+    s = sub.add_parser("mcp", help="run the MCP server on stdio")
+    s.set_defaults(fn=cmd_mcp)
 
     s = sub.add_parser("config", help="print the effective configuration")
     s.set_defaults(fn=cmd_config)

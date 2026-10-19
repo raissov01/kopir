@@ -32,10 +32,12 @@ class Record:
     def type(self) -> str:
         return self.meta.get("type", "")
 
+    def head_tokens(self) -> list[str]:
+        return tokens(f"{self.stem} {self.name} {self.description}")
+
     def doc(self) -> list[str]:
         # Name and description say what the record is about; weight them.
-        head = tokens(f"{self.stem} {self.name} {self.description}")
-        return head * 3 + tokens(self.body)
+        return self.head_tokens() * 3 + tokens(self.body)
 
 
 def split_frontmatter(text: str) -> tuple[list[str], str] | None:

@@ -1,4 +1,7 @@
-"""Readers for Claude Code and Codex conversations, with an incremental cache.
+"""Readers for agent conversations, with an incremental cache.
+
+Supported: Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, and a journal
+that any MCP client can append to (see mcp.py).
 
 A conversation is reduced to turns: what the person typed and the agent's
 last visible answer to it. Tool calls, thinking and subagent chatter are
@@ -13,7 +16,9 @@ import sqlite3
 import time
 from pathlib import Path
 
-CACHE_VERSION = 2
+from .redact import redact
+
+CACHE_VERSION = 4
 U_CHARS = 600
 A_CHARS = 900
 MAX_TURNS = 40
@@ -21,7 +26,7 @@ _WANTED = re.compile(rb'"type": ?"(?:user|assistant|ai-title)"')
 
 
 def _clip(text: str, n: int) -> str:
-    text = " ".join(text.split())
+    text = redact(" ".join(text.split()))
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
@@ -185,26 +190,183 @@ def read_codex_thread(con: sqlite3.Connection, row: sqlite3.Row) -> dict:
             "updated": _iso_ms(row["updated_at_ms"]), "turns": _keep_tail(turns)}
 
 
+# --- Gemini CLI ----------------------------------------------------------------
+
+def _gemini_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return ""
+
+
+def read_gemini_file(path: Path) -> dict:
+    """~/.gemini/tmp/<project>/chats/session-*.jsonl: a header line, then
+    messages, re-recorded under the same id as they grow, and `$set` lines
+    that replace fields of the conversation."""
+    header, messages = {}, {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if "$set" in d:
+            if isinstance(d["$set"].get("messages"), list):
+                messages = {m.get("id"): m for m in d["$set"]["messages"]}
+        elif "sessionId" in d and "type" not in d:
+            header = d
+        elif d.get("id") and d.get("type"):
+            messages[d["id"]] = d
+    root = path.parent.parent / ".project_root"
+    cwd = root.read_text(encoding="utf-8").strip() if root.is_file() else ""
+    turns = []
+    for m in messages.values():
+        text = _gemini_text(m.get("content")).strip()
+        if m.get("type") == "user" and _human_text(text):
+            turns.append({"u": _clip(text, U_CHARS), "a": "", "t": m.get("timestamp", "")})
+        elif m.get("type") == "gemini" and text and turns:
+            turns[-1]["a"] = _clip(text, A_CHARS)
+    return {"agent": "gemini", "id": header.get("sessionId", path.stem), "cwd": cwd,
+            "title": "", "started": header.get("startTime", ""),
+            "updated": turns[-1]["t"] if turns else header.get("lastUpdated", ""),
+            "turns": _keep_tail(turns)}
+
+
+# --- GitHub Copilot CLI -------------------------------------------------------------
+
+def read_copilot_file(path: Path) -> dict:
+    """<copilot home>/session-state/<id>/events.jsonl: typed events; the last
+    non-empty assistant message before the next user message is the answer."""
+    s = {"agent": "copilot", "id": path.parent.name, "cwd": "", "title": "",
+         "started": "", "updated": "", "turns": []}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        kind, data = d.get("type"), d.get("data") or {}
+        ts = d.get("timestamp", "")
+        if kind == "session.start":
+            s["cwd"] = (data.get("context") or {}).get("cwd", "")
+            s["started"] = data.get("startTime", ts)
+        elif kind == "user.message":
+            text = data.get("content") or ""
+            if _human_text(text):
+                s["turns"].append({"u": _clip(text, U_CHARS), "a": "", "t": ts})
+                s["updated"] = ts
+        elif kind == "assistant.message" and s["turns"]:
+            text = (data.get("content") or "").strip()
+            if text:
+                s["turns"][-1]["a"] = _clip(text, A_CHARS)
+                s["updated"] = ts
+    s["turns"] = _keep_tail(s["turns"])
+    return s
+
+
+# --- Journal: turns that MCP clients log themselves ------------------------------------
+
+def journal_path(cfg: dict) -> Path:
+    return Path(cfg["data_dir"]) / "journal.jsonl"
+
+
+def append_journal(cfg: dict, entry: dict) -> None:
+    p = journal_path(cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_journal(cfg: dict, since_iso: str) -> list[dict]:
+    p = journal_path(cfg)
+    if not p.is_file():
+        return []
+    by = {}
+    for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if d.get("t", "") < since_iso:
+            continue
+        agent = d.get("agent") or "mcp"
+        key = (agent, d.get("session") or d.get("t", "")[:10])
+        s = by.setdefault(key, {"agent": agent, "id": key[1], "cwd": d.get("cwd", ""),
+                                "title": d.get("title", ""), "started": d["t"],
+                                "updated": d["t"], "turns": []})
+        s["turns"].append({"u": _clip(d.get("u", ""), U_CHARS),
+                           "a": _clip(d.get("a", ""), A_CHARS), "t": d["t"]})
+        s["updated"] = d["t"]
+        s["title"] = s["title"] or d.get("title", "")
+    for s in by.values():
+        s["turns"] = _keep_tail(s["turns"])
+    return list(by.values())
+
+
 # --- Cache ---------------------------------------------------------------------
+
+FILE_READERS = {"gemini": read_gemini_file, "copilot": read_copilot_file}
+
+
+def _gemini_files(cfg: dict) -> list[Path]:
+    return list(Path(cfg["gemini_home"]).glob("tmp/*/chats/session-*.json*"))
+
+
+def _copilot_files(cfg: dict) -> list[Path]:
+    out = []
+    for home in cfg["copilot_homes"]:
+        out += Path(home).expanduser().glob("session-state/*/events.jsonl")
+    return out
+
+
+FILE_SOURCES = {"gemini": _gemini_files, "copilot": _copilot_files}
+
 
 class Cache:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.path = Path(cfg["cache_dir"]) / "sessions.json"
-        self.data = {"version": CACHE_VERSION, "claude": {}, "codex": {}}
+        self.data = {"version": CACHE_VERSION}
         try:
             d = json.loads(self.path.read_text(encoding="utf-8"))
             if d.get("version") == CACHE_VERSION:
                 self.data = d
         except (OSError, ValueError):
             pass
+        for agent in ("claude", "codex", *FILE_READERS):
+            self.data.setdefault(agent, {})
+        self.journal = []
 
     def refresh(self, agents: set[str], deadline: float) -> None:
         since = time.time() - self.cfg["window_days"] * 86400
-        if "claude" in agents:
-            self._refresh_claude(since, deadline)
-        if "codex" in agents:
-            self._refresh_codex(int(since * 1000))
+        for agent in agents:
+            try:
+                if agent == "claude":
+                    self._refresh_claude(since, deadline)
+                elif agent == "codex":
+                    self._refresh_codex(int(since * 1000))
+                elif agent in FILE_READERS:
+                    self._refresh_files(agent, since, deadline)
+            except OSError:
+                continue  # one unreadable agent must not hide the others
+        self.journal = read_journal(self.cfg, _iso_ms(int(since * 1000)))
+
+    def _refresh_files(self, agent: str, since: float, deadline: float) -> None:
+        live, old = {}, self.data[agent]
+        for p in FILE_SOURCES[agent](self.cfg):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if st.st_mtime < since:
+                continue
+            key, entry = str(p), old.get(str(p))
+            if entry is not None and entry.get("size") == st.st_size:
+                live[key] = entry
+            elif time.monotonic() < deadline:
+                live[key] = {"size": st.st_size, "session": FILE_READERS[agent](p)}
+            elif entry is not None:
+                live[key] = entry
+        self.data[agent] = live
 
     def _refresh_claude(self, since: float, deadline: float) -> None:
         root = Path(self.cfg["claude_projects"])
@@ -252,7 +414,7 @@ class Cache:
         self.data["codex"] = live
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         tmp = self.path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.path)
@@ -265,7 +427,13 @@ class Cache:
                 s["turns"] = claude_turns(e)
                 if s["turns"]:
                     out.append(s)
-        else:
-            out = [e["session"] for e in self.data["codex"].values() if e["session"]["turns"]]
+        elif agent in self.data and agent != "version":
+            out = [e["session"] for e in self.data[agent].values() if e["session"]["turns"]]
+        out += [s for s in self.journal if s["agent"] == agent]
         out.sort(key=lambda s: s.get("updated", ""), reverse=True)
         return out
+
+    def agents(self) -> set[str]:
+        """Every agent with at least one conversation in the window."""
+        found = {a for a in ("claude", "codex", *FILE_READERS) if self.sessions(a)}
+        return found | {s["agent"] for s in self.journal}

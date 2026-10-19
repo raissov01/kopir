@@ -1,4 +1,4 @@
-"""What the hooks inject: a digest of the other agent's recent chats at session
+"""What kopir injects: a digest of the other agents' recent chats at session
 start, and the matching memory records and past turns on every prompt."""
 import calendar
 import json
@@ -6,11 +6,16 @@ import re
 import time
 from pathlib import Path
 
-from . import memory, rank, sessions
+from . import agents, memory, rank, sessions
+from .redact import redact
 from .textnorm import tokens
 
-OTHER = {"claude": "codex", "codex": "claude"}
-LABEL = {"claude": "Claude Code", "codex": "Codex"}
+
+def others(cache: sessions.Cache, agent: str) -> list[dict]:
+    """Conversations of every agent except the one asking, newest first."""
+    out = [s for a in sorted(cache.agents()) if a != agent for s in cache.sessions(a)]
+    out.sort(key=lambda s: s.get("updated", ""), reverse=True)
+    return out
 
 
 def _short_path(p: str) -> str:
@@ -64,19 +69,19 @@ class Seen:
 # --- Session start ----------------------------------------------------------------
 
 def recent_digest(cfg: dict, cache: sessions.Cache, agent: str, cwd: str) -> str:
-    other = OTHER[agent]
-    recent = [s for s in cache.sessions(other) if _age_hours(s["updated"]) <= cfg["recent_hours"]]
+    recent = [s for s in others(cache, agent) if _age_hours(s["updated"]) <= cfg["recent_hours"]]
     if not recent:
         return ""
     # Already newest first; a stable sort lifts this project's chats to the top.
     recent.sort(key=lambda s: not _related(cwd, s["cwd"]))
-    lines = [f"## {LABEL[other]}: conversations in the last {cfg['recent_hours']} h "
-             f"(kopir; `kopir show {other} <id>` prints one in full)"]
+    lines = [f"## Other AI agents: conversations in the last {cfg['recent_hours']} h "
+             f"(kopir; `kopir show <agent> <id>` prints one in full)"]
     used = len(lines[0])
     for s in recent[: cfg["recent_sessions"]]:
         last = s["turns"][-1]
         title = s["title"] or s["turns"][0]["u"][:80]
-        block = (f"- {_when(s['updated'])} · {_short_path(s['cwd'])} · «{title}» "
+        block = (f"- [{agents.label(s['agent'])}] {_when(s['updated'])} · "
+                 f"{_short_path(s['cwd'])} · «{title}» "
                  f"({len(s['turns'])} turns, id {s['id'][:8]})\n"
                  f"  last ask: {last['u'][:220]}\n"
                  f"  answer: {last['a'][:320] or '(none yet)'}")
@@ -100,14 +105,15 @@ def index_text(cfg: dict) -> str:
 def recall_records(cfg: dict, prompt: str, seen: Seen | None) -> tuple[str, list[str]]:
     recs = memory.load(cfg["memory_dir"], cfg["index_files"])
     hits = rank.search(prompt, [r.doc() for r in recs], limit=cfg["recall_records"] + 3,
-                       min_score=cfg["min_score"], min_hits=cfg["min_hits"])
+                       min_score=cfg["min_score"], min_hits=cfg["min_hits"],
+                       heads=[set(r.head_tokens()) for r in recs])
     parts, names, used = [], [], 0
     for _, i in hits:
         r = recs[i]
         key = "rec:" + r.stem
         if seen is not None and key in seen.items:
             continue
-        body = r.body.strip()
+        body = redact(r.body.strip())
         if len(body) > cfg["record_chars"]:
             body = body[: cfg["record_chars"] - 1] + "…"
         stamp = " · ".join(x for x in (r.meta.get("source"), r.meta.get("observed_at")) if x)
@@ -127,21 +133,23 @@ def recall_records(cfg: dict, prompt: str, seen: Seen | None) -> tuple[str, list
 
 def recall_turns(cfg: dict, cache: sessions.Cache, agent: str, prompt: str,
                  seen: Seen | None) -> tuple[str, list[str]]:
-    other = OTHER[agent]
-    flat = [(s, t) for s in cache.sessions(other) for t in s["turns"]]
+    flat = [(s, t) for s in others(cache, agent) for t in s["turns"]]
     if not flat:
         return "", []
-    docs = [tokens(f"{s['title']} {t['u']}") * 2 + tokens(t["a"]) for s, t in flat]
+    heads = [tokens(f"{s['title']} {t['u']}") for s, t in flat]
+    docs = [h * 2 + tokens(t["a"]) for h, (s, t) in zip(heads, flat)]
     hits = rank.search(prompt, docs, limit=cfg["recall_turns"] + 3,
-                       min_score=cfg["min_score"], min_hits=cfg["min_hits"])
+                       min_score=cfg["min_score"], min_hits=cfg["min_hits"],
+                       heads=[set(h) for h in heads])
     parts, keys, used = [], [], 0
     for _, i in hits:
         s, t = flat[i]
-        key = f"turn:{s['id']}:{t['t']}"
+        key = f"turn:{s['agent']}:{s['id']}:{t['t']}"
         if seen is not None and key in seen.items:
             continue
-        block = (f"- {_when(t['t'])} · {_short_path(s['cwd'])} · «{s['title'][:70]}» "
-                 f"(id {s['id'][:8]})\n  asked: {t['u'][:400]}\n  answered: {t['a'][:600]}")
+        block = (f"- [{agents.label(s['agent'])}] {_when(t['t'])} · {_short_path(s['cwd'])} · "
+                 f"«{(s['title'] or s['turns'][0]['u'])[:70]}» (id {s['id'][:8]})\n"
+                 f"  asked: {t['u'][:400]}\n  answered: {t['a'][:600]}")
         if used + len(block) > cfg["budget_turns"]:
             continue
         parts.append(block)
@@ -151,4 +159,4 @@ def recall_turns(cfg: dict, cache: sessions.Cache, agent: str, prompt: str,
             break
     if not parts:
         return "", []
-    return f"## Related {LABEL[other]} turns (kopir)\n" + "\n".join(parts), keys
+    return "## Related turns from other AI agents (kopir)\n" + "\n".join(parts), keys
